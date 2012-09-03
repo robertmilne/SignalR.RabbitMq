@@ -51,14 +51,14 @@ namespace SignalR.RabbitMq.Example
 
             BundleTable.Bundles.RegisterTemplateBundles();
 
+            var factory = new ConnectionFactory 
+            { 
+                UserName = "guest",
+                Password = "guest"
+            };
             var exchange = "SignalRExchange";
 
-            var connection = factory.CreateConnection();
-            var channel = connection.CreateModel();
-            channel.ExchangeDeclare(exchange, "topic", true);
-
-            GlobalHost.DependencyResolver.UseRabbitMq(exchange, channel);
-
+            GlobalHost.DependencyResolver.UseRabbitMq(factory, exchange);
         }
     }
 }

@@ -1,28 +1,28 @@
-﻿using System;
+﻿using Newtonsoft.Json;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
-using RabbitMQ.Client;
-using RabbitMQ.Client.Events;
 
 namespace SignalR.RabbitMQ
 {
     public class RabbitMqMessageBus : IMessageBus, IIdGenerator<long>
     {
         private readonly InProcessMessageBus<long> _bus;
-        private readonly IModel _rabbitmqchannel;
-        private readonly string _rabbitmqExchangeName;
+        private readonly ConnectionFactory _connectionFactory;
+        private readonly string _exchangeName;
+        private IModel _channel;
         private int _resource = 0;
-        private int _count;
 
-        public RabbitMqMessageBus(IDependencyResolver resolver, string rabbitMqExchangeName, IModel rabbitMqChannel)
+        public RabbitMqMessageBus(IDependencyResolver resolver, ConnectionFactory connectionFactory, string exchangeName)
         {
             _bus = new InProcessMessageBus<long>(resolver, this);
-            _rabbitmqchannel = rabbitMqChannel;
-            _rabbitmqExchangeName = rabbitMqExchangeName;
+            _connectionFactory = connectionFactory;
+            _exchangeName = exchangeName;
 
             EnsureConnection();
         }
@@ -50,53 +50,64 @@ namespace SignalR.RabbitMQ
 
         public long GetNext()
         {
-            return _count++;
+            return DateTime.Now.Ticks;
         }
 
         private void SendMessage(object state)
         {
             var message = (RabbitMqMessageWrapper) state;
             byte[] payload = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(message));
-            _rabbitmqchannel.BasicPublish(_rabbitmqExchangeName, message.EventKey, null, payload);
+
+            if (_channel != null && _channel.IsOpen)
+                _channel.BasicPublish(_exchangeName, message.EventKey, null, payload);
         }
 
         private void EnsureConnection()
         {
-            var tcs = new TaskCompletionSource<Object>();
-
             if (1 == Interlocked.Exchange(ref _resource, 1))
             {
                 return;
             }
 
             ThreadPool.QueueUserWorkItem(_ =>
+            {
+                while (true)
                 {
                     try
                     {
-
-                        var queue = _rabbitmqchannel.QueueDeclare("", false, false, true, null);
-                        _rabbitmqchannel.QueueBind(queue.QueueName, _rabbitmqExchangeName, "#");
-
-                        var consumer = new QueueingBasicConsumer(_rabbitmqchannel);
-                        _rabbitmqchannel.BasicConsume(queue.QueueName, false, consumer);
-
-                        while (true)
+                        using (var connection = _connectionFactory.CreateConnection())
                         {
-                            var ea = (BasicDeliverEventArgs) consumer.Queue.Dequeue();
+                            _channel = connection.CreateModel();
+                            _channel.ExchangeDeclare(_exchangeName, "topic", true);
 
-                            _rabbitmqchannel.BasicAck(ea.DeliveryTag, false);
+                            var queue = _channel.QueueDeclare("", false, false, true, null);
+                            _channel.QueueBind(queue.QueueName, _exchangeName, "#");
 
-                            string json = Encoding.UTF8.GetString(ea.Body);
-                                                  
-                            var message = JsonConvert.DeserializeObject<RabbitMqMessageWrapper>(json);
-                            _bus.Send(message.ConnectionIdentifier, message.EventKey, message.Value);
+                            var consumer = new QueueingBasicConsumer(_channel);
+                            _channel.BasicConsume(queue.QueueName, false, consumer);
+
+                            while (_channel.IsOpen)
+                            {
+                                var ea = (BasicDeliverEventArgs)consumer.Queue.Dequeue();
+
+                                _channel.BasicAck(ea.DeliveryTag, false);
+
+                                string json = Encoding.UTF8.GetString(ea.Body);
+
+                                var message = JsonConvert.DeserializeObject<RabbitMqMessageWrapper>(json);
+
+                                _bus.Send(message.ConnectionIdentifier, message.EventKey, message.Value);
+                            }
                         }
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        tcs.SetException(ex);
+                        // log this or error callback?
                     }
-                });
+
+                    Thread.Sleep(TimeSpan.FromSeconds(5));
+                }
+            });
         }
     }
 }
